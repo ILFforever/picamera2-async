@@ -6,6 +6,7 @@ import contextlib
 import json
 import logging
 import os
+import queue
 import selectors
 import sys
 import tempfile
@@ -80,6 +81,7 @@ class CameraManager:
         self.cameras = {}
         self._lock = threading.Lock()
         self._cms = None
+
 
     def setup(self) -> None:
         self.thread = threading.Thread(target=self.listen, daemon=True)
@@ -371,6 +373,11 @@ class Picamera2:
         atexit.register(self.close)
         # Set Allocator
         self.allocator = DmaAllocator() if allocator is None else allocator
+        
+        #Added for async DNG processing
+        self._dng_queue = queue.Queue()
+        self._dng_processor = None
+        self._dng_processing_active = False
 
     @property
     def camera_manager(self) -> libcamera.CameraManager:
@@ -702,6 +709,19 @@ class Picamera2:
             return
 
         self.stop()
+        
+        if self._dng_processing_active:
+            print("[DNG] Shutting down background processor...")
+        self._dng_processing_active = False
+        if self._dng_queue:
+            self._dng_queue.put(None)  # Signal shutdown
+        if self._dng_processor and self._dng_processor.is_alive():
+            self._dng_processor.join(timeout=3.0)  # Wait up to 3 seconds
+            if self._dng_processor.is_alive():
+                print("[DNG WARNING] Background thread did not terminate cleanly")
+            else:
+                print("[DNG] Background processor terminated successfully")
+                
         # camera.release() now throws an error if it fails.
         self.camera.release()
         self._cm.cleanup(self.camera_idx)
@@ -1520,18 +1540,39 @@ class Picamera2:
         functions = [partial(self.set_frame_drops_, num_frames), self.drop_frames_]
         return self.dispatch_functions(functions, wait, signal_function, immediate=True)
 
+    # EDIT for DNG processing
     def capture_file_(self, file_output, name, format=None, exif_data=None):
         if not self.completed_requests:
             return (False, None)
         request = self.completed_requests.pop(0)
+        print(f"capture_file_: got request {request}")
         if name == "raw" and formats.is_raw(self.camera_config["raw"]["format"]):
-            request.save_dng(file_output)
+            # Start DNG processor if needed
+            print("[DEBUG] Capture_file_ Taking background DNG path")
+            if not self._dng_processing_active:
+                self._start_dng_processor()
+            
+            # Get metadata before queuing
+            result = request.get_metadata()
+            
+            # Convert file_output to simple filename string for thread safety
+            if hasattr(file_output, 'name'):
+                filename = file_output.name
+            else:
+                filename = str(file_output)
+            
+            # Queue for background processing with filename string only
+            request.acquire()
+            self._dng_queue.put((request, filename))
+            
+            return (True, result)
         else:
+            # Original path unchanged
+            print("[DEBUG] Capture_file_ Taking synchronous path")  
             request.save(name, file_output, format=format, exif_data=exif_data)
-
-        result = request.get_metadata()
-        request.release()
-        return (True, result)
+            result = request.get_metadata()
+            request.release()
+            return (True, result)
 
     @overload
     def capture_file(self, file_output, name="main", format=None, wait: None = ...,
@@ -2662,3 +2703,114 @@ class Picamera2:
                      partial(wait_for_af_state, self,
                              {controls.AfStateEnum.Focused, controls.AfStateEnum.Failed, controls.AfStateEnum.Idle})]
         return self.dispatch_functions(functions, wait, signal_function)
+
+    def _start_dng_processor(self):
+        """Start the background DNG processing thread"""
+        if self._dng_processor is None:
+            #print("[DNG] Starting background DNG processor thread")
+            self._dng_processing_active = True
+            self._dng_processor = threading.Thread(
+                target=self._process_dng_queue, 
+                daemon=True,
+                name="DNG-Processor"
+            )
+            self._dng_processor.start()
+
+    def _process_dng_queue(self):
+        """Optimized background DNG processor"""
+        import os
+        os.nice(10)
+        
+        while self._dng_processing_active:
+            try:
+                dng_data = self._dng_queue.get(timeout=1.0)
+                if dng_data is None:
+                    break
+                request, filename = dng_data
+                # Do a memory check
+                import psutil
+                mem_before = psutil.virtual_memory().available / 1024 / 1024
+                if mem_before < 25:
+                    print(f"[DNG] Low memory ({mem_before:.1f}MB), skipping {filename}")
+                    request.release()
+                    continue
+                
+                print(f"[DNG] Memory before: {mem_before:.1f}MB, processing {filename}")
+                start_time = time.time()
+                
+                try:
+                    # Fast DNG processing
+                    self._process_single_dng_fast(request, filename)
+                    
+                    process_time = time.time() - start_time
+                    print(f"[DNG] Background processed {filename} in {process_time:.3f}s")
+                    
+                except Exception as e:
+                    print(f"[DNG ERROR] Failed to save {filename}: {e}")
+                finally:
+                    request.release()
+                    
+                    # Aggressive cleanup
+                    import gc
+                    gc.collect()
+                    time.sleep(0.1)\
+                    
+                    mem_after = psutil.virtual_memory().available / 1024 / 1024
+                    print(f"[DNG] Memory after: {mem_after:.1f}MB (freed {mem_after - mem_before:.1f}MB)")
+                    
+            except queue.Empty:
+                continue
+            except Exception as e:
+                print(f"[DNG THREAD ERROR] {e}")
+
+    def _process_single_dng_fast(self, request, filename):
+        """Memory-safe DNG processing copied over from request.save_dng"""
+        from picamera2.request import _MappedBuffer
+        from pidng.camdefs import Picamera2Camera
+        from pidng.core import PICAM2DNG
+        from picamera2.sensor_format import SensorFormat
+        import gc
+        
+        config = request.config["raw"]
+        metadata = request.get_metadata()
+        
+        raw = None
+        buffer = None
+        camera = None
+        r = None
+        
+        try:
+            with _MappedBuffer(request, "raw", write=False) as b:
+                buffer = np.array(b, copy=False, dtype=np.uint8)
+                
+                h, stride = config['size'][1], config['stride']
+                raw = buffer.reshape((h, stride))
+                
+                fmt = SensorFormat(config['format'])
+                if fmt.packing == 'PISP_COMP1':
+                    raw = request.picam2.helpers.decompress(raw)
+                    fmt.bit_depth = 16
+                    config = config.copy()
+                    config['format'] = fmt.unpacked
+                    config['stride'] = raw.shape[1]
+                    config['framesize'] = raw.shape[0] * raw.shape[1]
+                
+                camera = Picamera2Camera(config, metadata)
+                r = PICAM2DNG(camera)
+                r.options(compress=0)
+                r.convert(raw, str(filename))
+                
+        finally:
+            # Explicit cleanup in reverse order
+            if r is not None:
+                del r
+            if camera is not None:
+                del camera
+            if raw is not None:
+                del raw
+            if buffer is not None:
+                del buffer
+            
+            # Force immediate garbage collection
+            gc.collect()
+            time.sleep(0.1)
