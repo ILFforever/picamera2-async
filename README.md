@@ -9,7 +9,7 @@ There are also many examples in the `examples` folder of this repository, and so
 
 ## Intention of this fork
 *This fork aims to add background processing for dng files*
-this allows the camera to shoot multiple shots while processing dnf files in a background thread (pi zero 2 takes ~3 seconds for a 12mp dng from Picam v3)
+this allows the camera to shoot multiple shots while processing dng files in a background thread (pi zero 2 takes ~3 seconds for a 12mp dng from Picam v3)
 
 
 
