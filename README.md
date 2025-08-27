@@ -1,14 +1,17 @@
 # Picamera2
 
----
-*Picamera2* is currently available here as a beta release. This means there may still be some issues and bugs which we shall work on fixing, and where users identify particularly useful features we may still consider implementing them. Mostly we shall be working on bugs, stability, support, examples and documentation, as well as keeping up with ongoing _libcamera_ development. There will also be quite a strong presumption _against_ making signficant code changes unless it seems absolutely necessary, especially any that break existing behaviour or APIs.
----
-
 *Picamera2* is the libcamera-based replacement for *Picamera* which was a Python interface to the Raspberry Pi's legacy camera stack. *Picamera2* also presents an easy to use Python API.
+
 
 You can find [documentation here](https://datasheets.raspberrypi.com/camera/picamera2-manual.pdf) which should help you to get started.
 
 There are also many examples in the `examples` folder of this repository, and some further _Qt_ application examples in the `apps` folder.
+
+## Intention of this fork
+*This fork aims to add background processing for dng files*
+this allows the camera to shoot multiple shots while processing dnf files in a background thread (pi zero 2 takes ~3 seconds for a 12mp dng from Picam v3)
+
+
 
 ## Installation
 
