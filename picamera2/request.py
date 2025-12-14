@@ -33,10 +33,17 @@ class _MappedBuffer:
             stream = request.stream_map[stream]
         assert request.request is not None
         self.__fb = request.request.buffers[stream]
-        self.__sync = request.picam2.allocator.sync(request.picam2.allocator, self.__fb, write)
+        self.__allocator = request.picam2.allocator
+        self.__sync = self.__allocator.sync(self.__allocator, self.__fb, write)
 
     def __enter__(self) -> Any:
-        self.__mm = self.__sync.__enter__()
+        if self.__sync:
+            # For legacy LibcameraAllocator, which you shouldn't be using.
+            self.__mm = self.__sync.__enter__()
+        else:
+            self.__mm = self.__allocator.mapped_buffers.get(self.__fb, None)
+        if self.__mm is None:
+            raise RuntimeError("failed to find buffer")
         return self.__mm
 
     def __exit__(self, exc_type: Any, exc_value: Any, exc_traceback: Any) -> None:
